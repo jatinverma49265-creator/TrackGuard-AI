@@ -1,6 +1,6 @@
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set
 import cv2
 import numpy as np
 
@@ -83,10 +83,12 @@ def annotate_frame(
     annotated = frame.copy()
 
     for det in detections:
-        x1, y1, x2, y2, conf, cls_id = det
+        x1, y1, x2, y2, conf, cls_id = det[:6]
+        track_id = det[6] if len(det) > 6 else None
         cls_id = int(cls_id)
         label = COCO_VEHICLE_CLASSES.get(cls_id, "vehicle")
-        caption = f"{label} {conf:.2f}"
+        track_label = f" ID:{track_id}" if track_id is not None else ""
+        caption = f"{label}{track_label} {conf:.2f}"
 
         # Bounding box
         cv2.rectangle(
@@ -150,8 +152,9 @@ def process_video(
     config: Optional[TrackGuardConfig] = None,
     model: Optional[Any] = None,
     max_frames: Optional[int] = None,
+    enable_tracking: bool = True,
 ) -> VideoProcessingSummary:
-    """Processes a video file with YOLO vehicle detection and writes annotated video.
+    """Detects and annotates vehicles, optionally tracking them with ByteTrack.
     
     Args:
         input_path: Path to the input video file.
@@ -159,6 +162,7 @@ def process_video(
         config: Optional TrackGuardConfig for inference parameters.
         model: Optional pre-instantiated YOLO model or compatible mock.
         max_frames: Optional limit on frames to process (useful for short tests/benchmarks).
+        enable_tracking: Use ByteTrack to assign persistent IDs across video frames.
 
     Returns:
         VideoProcessingSummary containing execution metrics.
@@ -214,14 +218,24 @@ def process_video(
             if not ret or frame is None:
                 break
 
-            # Run inference
-            results = model(
+            inference = model.track if enable_tracking else model
+            inference_kwargs = {
+                "conf": cfg.confidence_threshold,
+                "iou": cfg.iou_threshold,
+                "classes": list(VEHICLE_CLASS_IDS),
+                "device": device,
+                "verbose": False,
+            }
+            if enable_tracking:
+                # Ultralytics 8.4.182 creates fresh trackers with persist=False.
+                # Persist from frame two onward so state spans this video only.
+                inference_kwargs.update(
+                    tracker="bytetrack.yaml",
+                    persist=frames_processed > 0,
+                )
+            results = inference(
                 frame,
-                conf=cfg.confidence_threshold,
-                iou=cfg.iou_threshold,
-                classes=list(VEHICLE_CLASS_IDS),
-                device=device,
-                verbose=False,
+                **inference_kwargs,
             )
 
             # Parse vehicle detections
@@ -233,8 +247,11 @@ def process_video(
                     if cls_id in VEHICLE_CLASS_IDS:
                         xyxy = box.xyxy[0].tolist()
                         conf = float(box.conf[0].item())
+                        track_id = None
+                        if getattr(box, "id", None) is not None:
+                            track_id = int(box.id[0].item())
                         frame_detections.append(
-                            (xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf, cls_id)
+                            (xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf, cls_id, track_id)
                         )
 
             total_vehicle_detections += len(frame_detections)
@@ -277,6 +294,12 @@ if __name__ == "__main__":
     parser.add_argument("--conf", type=float, default=0.35, help="Confidence threshold (default: 0.35)")
     parser.add_argument("--device", default="auto", help="Inference device: 'cpu', 'cuda', or 'auto'")
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of frames to process")
+    parser.add_argument(
+        "--no-track",
+        dest="enable_tracking",
+        action="store_false",
+        help="Run detection only without ByteTrack IDs",
+    )
 
     args = parser.parse_args()
     cfg = TrackGuardConfig(confidence_threshold=args.conf, device=args.device)
@@ -285,6 +308,7 @@ if __name__ == "__main__":
         output_path=args.output,
         config=cfg,
         max_frames=args.max_frames,
+        enable_tracking=args.enable_tracking,
     )
     print("\n[TrackGuard AI] Vehicle Detection Complete:")
     for k, v in summary.to_dict().items():

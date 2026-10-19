@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
 
@@ -69,20 +69,22 @@ class TestDetector(unittest.TestCase):
         mock_box.cls = [MagicMock(item=lambda: 2)]  # class 2 = car
         mock_box.xyxy = [MagicMock(tolist=lambda: [30.0, 40.0, 100.0, 120.0])]
         mock_box.conf = [MagicMock(item=lambda: 0.92)]
+        mock_box.id = [MagicMock(item=lambda: 17)]
 
         mock_result = MagicMock()
         mock_result.boxes = [mock_box]
 
         mock_model = MagicMock()
-        mock_model.return_value = [mock_result]
+        mock_model.track.return_value = [mock_result]
 
         cfg = TrackGuardConfig(confidence_threshold=0.3, iou_threshold=0.5)
-        summary = process_video(
-            input_path=synthetic_video,
-            output_path=out_path,
-            config=cfg,
-            model=mock_model,
-        )
+        with patch("src.detector.annotate_frame", wraps=annotate_frame) as annotate:
+            summary = process_video(
+                input_path=synthetic_video,
+                output_path=out_path,
+                config=cfg,
+                model=mock_model,
+            )
 
         self.assertTrue(out_path.exists())
         self.assertGreater(out_path.stat().st_size, 0)
@@ -91,6 +93,66 @@ class TestDetector(unittest.TestCase):
         self.assertGreater(summary.processing_fps, 0.0)
         self.assertEqual(summary.video_width, 320)
         self.assertEqual(summary.video_height, 240)
+        self.assertEqual(mock_model.track.call_count, 5)
+        self.assertEqual(mock_model.track.call_args.kwargs["tracker"], "bytetrack.yaml")
+        self.assertTrue(mock_model.track.call_args.kwargs["persist"])
+        self.assertEqual(annotate.call_args_list[0].args[1][0][-1], 17)
+
+    def test_detection_only_mode_uses_model_without_tracking(self):
+        synthetic_video = self._create_synthetic_video("detection_only_in.mp4")
+        out_path = self.temp_path / "detection_only_out.mp4"
+        mock_box = MagicMock()
+        mock_box.cls = [MagicMock(item=lambda: 2)]
+        mock_box.xyxy = [MagicMock(tolist=lambda: [30.0, 40.0, 100.0, 120.0])]
+        mock_box.conf = [MagicMock(item=lambda: 0.92)]
+        mock_box.id = None
+        mock_result = MagicMock()
+        mock_result.boxes = [mock_box]
+        mock_model = MagicMock()
+        mock_model.return_value = [mock_result]
+
+        summary = process_video(
+            synthetic_video,
+            out_path,
+            model=mock_model,
+            enable_tracking=False,
+        )
+
+        self.assertEqual(summary.total_frames, 5)
+        self.assertEqual(summary.vehicle_detections_count, 5)
+        self.assertEqual(mock_model.call_count, 5)
+        mock_model.track.assert_not_called()
+
+    def test_tracker_reinitializes_between_videos_and_persists_within_each(self):
+        synthetic_video = self._create_synthetic_video("tracker_lifecycle_in.mp4")
+        mock_box = MagicMock()
+        mock_box.cls = [MagicMock(item=lambda: 2)]
+        mock_box.xyxy = [MagicMock(tolist=lambda: [30.0, 40.0, 100.0, 120.0])]
+        mock_box.conf = [MagicMock(item=lambda: 0.92)]
+        mock_box.id = [MagicMock(item=lambda: 17)]
+        mock_result = MagicMock()
+        mock_result.boxes = [mock_box]
+        mock_model = MagicMock()
+        mock_model.track.return_value = [mock_result]
+
+        first_output = self.temp_path / "first_video_out.mp4"
+        second_output = self.temp_path / "second_video_out.mp4"
+        process_video(synthetic_video, first_output, model=mock_model)
+        process_video(synthetic_video, second_output, model=mock_model)
+
+        self.assertEqual(mock_model.track.call_count, 10)
+        persist_values = [call.kwargs["persist"] for call in mock_model.track.call_args_list]
+        self.assertEqual(persist_values, [False, True, True, True, True] * 2)
+
+    def test_annotate_frame_includes_track_id_when_available(self):
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        detections = [(30.0, 40.0, 100.0, 120.0, 0.88, 2, 17)]
+
+        with patch("src.detector.cv2.putText") as put_text:
+            annotate_frame(frame, detections, frame_idx=1, current_fps=30.0)
+
+        labels = [call.args[1] for call in put_text.call_args_list]
+        self.assertIn("car ID:17 0.88", labels)
 
 
 if __name__ == "__main__":

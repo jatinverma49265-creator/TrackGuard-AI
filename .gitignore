@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TrackGuard AI local directories & media
+data/
+models/
+weights/
+runs/
+videos/
+evidence/
+*.mp4
+*.avi
+*.mkv

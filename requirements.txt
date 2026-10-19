@@ -1,0 +1,6 @@
+# TrackGuard AI - Core Dependencies
+pydantic>=2.6.0,<3.0.0
+numpy>=1.26.0
+opencv-python>=4.9.0
+pytest>=8.0.0
+ultralytics>=8.0.0

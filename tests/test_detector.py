@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
 
-from src.config import TrackGuardConfig
+from src.config import TrackBoundary, TrackGuardConfig
 from src.detector import (
     COCO_VEHICLE_CLASSES,
     VEHICLE_CLASS_IDS,
@@ -90,6 +90,7 @@ class TestDetector(unittest.TestCase):
         self.assertGreater(out_path.stat().st_size, 0)
         self.assertEqual(summary.total_frames, 5)
         self.assertEqual(summary.vehicle_detections_count, 5)
+        self.assertEqual(summary.event_candidates, [])
         self.assertGreater(summary.processing_fps, 0.0)
         self.assertEqual(summary.video_width, 320)
         self.assertEqual(summary.video_height, 240)
@@ -143,6 +144,50 @@ class TestDetector(unittest.TestCase):
         self.assertEqual(mock_model.track.call_count, 10)
         persist_values = [call.kwargs["persist"] for call in mock_model.track.call_args_list]
         self.assertEqual(persist_values, [False, True, True, True, True] * 2)
+
+    def test_synthetic_video_emits_boundary_candidate_without_model_download(self):
+        synthetic_video = self._create_synthetic_video("boundary_crossing_in.mp4")
+        out_path = self.temp_path / "boundary_crossing_out.mp4"
+        centers = [120.0, 140.0, 180.0, 200.0, 220.0]
+        frame_results = []
+        for center_x in centers:
+            box = MagicMock()
+            box.cls = [MagicMock(item=lambda: 2)]
+            box.xyxy = [MagicMock(tolist=lambda cx=center_x: [cx - 10.0, 100.0, cx + 10.0, 120.0])]
+            box.conf = [MagicMock(item=lambda: 0.91)]
+            box.id = [MagicMock(item=lambda: 23)]
+            result = MagicMock()
+            result.boxes = [box]
+            frame_results.append([result])
+
+        mock_model = MagicMock()
+        mock_model.track.side_effect = frame_results
+        cfg = TrackGuardConfig(
+            device="cpu",
+            track_boundary=TrackBoundary(
+                start_x=0.5,
+                start_y=0.2,
+                end_x=0.5,
+                end_y=0.8,
+            ),
+            boundary_hysteresis_pixels=5.0,
+        )
+
+        summary = process_video(synthetic_video, out_path, config=cfg, model=mock_model)
+
+        self.assertEqual(summary.total_frames, 5)
+        self.assertTrue(out_path.is_file())
+        self.assertEqual(len(summary.event_candidates), 1)
+        event = summary.event_candidates[0]
+        self.assertEqual(event.track_id, 23)
+        self.assertEqual(event.frame_index, 3)
+        self.assertEqual(event.video_time_seconds, 0.2)
+        self.assertIsNone(event.timestamp)
+        self.assertEqual(event.review_status.value, "pending_review")
+        self.assertIn("positive_to_negative", event.notes)
+        serialized_event = summary.to_dict()["event_candidates"][0]
+        self.assertEqual(serialized_event["video_time_seconds"], 0.2)
+        self.assertEqual(serialized_event["review_status"], "pending_review")
 
     def test_annotate_frame_includes_track_id_when_available(self):
         frame = np.zeros((240, 320, 3), dtype=np.uint8)

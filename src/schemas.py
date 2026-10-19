@@ -59,8 +59,9 @@ class TrackEventRecord(BaseModel):
     event_type: EventType = Field(
         description="Category of the candidate observation."
     )
-    timestamp: datetime = Field(
-        description="Timestamp when the candidate event occurred or was logged."
+    timestamp: Optional[datetime] = Field(
+        default=None,
+        description="Optional wall-clock timestamp when known; omitted for video-relative events."
     )
     track_id: Optional[int] = Field(
         default=None,
@@ -71,6 +72,11 @@ class TrackEventRecord(BaseModel):
         default=None,
         ge=0,
         description="Video frame index corresponding to the peak or trigger moment."
+    )
+    video_time_seconds: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Time offset in seconds from the start of the source video."
     )
     confidence: Optional[float] = Field(
         default=None,

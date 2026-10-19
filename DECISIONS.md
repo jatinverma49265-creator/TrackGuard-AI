@@ -29,3 +29,8 @@
 - **Context**: Unit tests must execute quickly and reliably in CI and developer environments without downloading multi-gigabyte video datasets or heavy weights.
 - **Decision**: Use OpenCV in unit tests to dynamically generate lightweight 5-frame synthetic videos and mock model predictions.
 - **Consequence**: 100% offline, deterministic testing of the video ingest-detect-annotate-export pipeline in under 3 seconds.
+
+## Decision 7: Track-Boundary Candidate Detection
+- **Context**: Fixed-camera video can be configured with one manually selected finite boundary segment. Boundary observations must remain reviewable candidates and should not depend on costly image processing.
+- **Decision**: Store the segment endpoints as normalized frame coordinates. Use each ByteTrack ID's bounding-box bottom-center point and finite-segment intersection, with a dedicated 5-pixel stable-side hysteresis margin. Emit a candidate on each stable crossing in either direction and re-arm for later recrossings.
+- **Consequence**: Per-track state remains local to one video-processing run. Candidates use `TRACK_LIMIT_CANDIDATE`, remain `pending_review`, and record frame index plus video-relative seconds. No wall-clock time is invented when source recording time is unavailable; candidate persistence and evidence clips remain out of scope.

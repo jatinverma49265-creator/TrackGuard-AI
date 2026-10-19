@@ -1,5 +1,19 @@
-from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class TrackBoundary(BaseModel):
+    """Finite track-boundary segment with endpoints normalized to [0, 1]."""
+    start_x: float = Field(ge=0.0, le=1.0)
+    start_y: float = Field(ge=0.0, le=1.0)
+    end_x: float = Field(ge=0.0, le=1.0)
+    end_y: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_distinct_endpoints(self):
+        if self.start_x == self.end_x and self.start_y == self.end_y:
+            raise ValueError("Track boundary endpoints must be different")
+        return self
 
 
 class TrackGuardConfig(BaseModel):
@@ -60,6 +74,15 @@ class TrackGuardConfig(BaseModel):
         default=0.0,
         ge=0.0,
         description="Buffer margin in pixels applied to track-limit boundary polygons."
+    )
+    track_boundary: Optional[TrackBoundary] = Field(
+        default=None,
+        description="Optional finite boundary segment with normalized frame coordinates."
+    )
+    boundary_hysteresis_pixels: float = Field(
+        default=5.0,
+        ge=0.0,
+        description="Stable-side distance from a configured boundary required to confirm a crossing."
     )
 
     @field_validator("confidence_threshold", "iou_threshold")

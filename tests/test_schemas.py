@@ -40,6 +40,19 @@ class TestTrackEventSchemas(unittest.TestCase):
         self.assertIsNone(record.track_id)
         self.assertIsNone(record.evidence_reference)
 
+    def test_video_relative_candidate_does_not_invent_wall_clock_timestamp(self):
+        record = TrackEventRecord(
+            event_id="evt-video-time",
+            event_type=EventType.TRACK_LIMIT_CANDIDATE,
+            frame_index=12,
+            video_time_seconds=0.44,
+        )
+
+        self.assertIsNone(record.timestamp)
+        self.assertEqual(record.frame_index, 12)
+        self.assertEqual(record.video_time_seconds, 0.44)
+        self.assertEqual(record.review_status, ReviewStatus.PENDING_REVIEW)
+
     def test_invalid_confidence_raises_error(self):
         with self.assertRaises(ValidationError):
             TrackEventRecord(

@@ -9,7 +9,9 @@ try:
 except ImportError:
     torch = None
 
-from src.config import TrackGuardConfig
+from src.config import TrackBoundary, TrackGuardConfig
+from src.events import BoundaryEventDetector
+from src.schemas import TrackEventRecord
 
 # COCO vehicle class identifiers
 COCO_VEHICLE_CLASSES: Dict[int, str] = {
@@ -34,6 +36,7 @@ class VideoProcessingSummary:
         video_width: int,
         video_height: int,
         source_fps: float,
+        event_candidates: Optional[list[TrackEventRecord]] = None,
     ):
         self.input_path = input_path
         self.output_path = output_path
@@ -44,6 +47,7 @@ class VideoProcessingSummary:
         self.video_width = video_width
         self.video_height = video_height
         self.source_fps = source_fps
+        self.event_candidates = event_candidates or []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -56,6 +60,7 @@ class VideoProcessingSummary:
             "video_width": self.video_width,
             "video_height": self.video_height,
             "source_fps": round(self.source_fps, 2),
+            "event_candidates": [event.model_dump(mode="json") for event in self.event_candidates],
         }
 
 
@@ -78,9 +83,13 @@ def annotate_frame(
     detections: list,
     frame_idx: int,
     current_fps: float,
+    boundary_line: Optional[tuple[tuple[int, int], tuple[int, int]]] = None,
 ) -> np.ndarray:
     """Draws bounding boxes, labels, and telemetry overlay on a single frame."""
     annotated = frame.copy()
+
+    if boundary_line is not None:
+        cv2.line(annotated, boundary_line[0], boundary_line[1], (0, 0, 255), 2)
 
     for det in detections:
         x1, y1, x2, y2, conf, cls_id = det[:6]
@@ -208,6 +217,22 @@ def process_video(
 
         frames_processed = 0
         total_vehicle_detections = 0
+        event_candidates: list[TrackEventRecord] = []
+        boundary_detector = None
+        boundary_line = None
+        if cfg.track_boundary is not None:
+            x_scale = max(width - 1, 1)
+            y_scale = max(height - 1, 1)
+            boundary_line = (
+                (int(round(cfg.track_boundary.start_x * x_scale)), int(round(cfg.track_boundary.start_y * y_scale))),
+                (int(round(cfg.track_boundary.end_x * x_scale)), int(round(cfg.track_boundary.end_y * y_scale))),
+            )
+            boundary_detector = BoundaryEventDetector(
+                cfg.track_boundary,
+                width,
+                height,
+                cfg.boundary_hysteresis_pixels,
+            )
         start_time = time.perf_counter()
 
         while True:
@@ -253,6 +278,16 @@ def process_video(
                         frame_detections.append(
                             (xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf, cls_id, track_id)
                         )
+                        if boundary_detector is not None:
+                            event = boundary_detector.update(
+                                track_id=track_id,
+                                bbox=(xyxy[0], xyxy[1], xyxy[2], xyxy[3]),
+                                frame_index=frames_processed + 1,
+                                video_time_seconds=frames_processed / source_fps,
+                                confidence=conf,
+                            )
+                            if event is not None:
+                                event_candidates.append(event)
 
             total_vehicle_detections += len(frame_detections)
             frames_processed += 1
@@ -260,7 +295,13 @@ def process_video(
             elapsed = max(time.perf_counter() - start_time, 1e-5)
             curr_fps = frames_processed / elapsed
 
-            annotated = annotate_frame(frame, frame_detections, frames_processed, curr_fps)
+            annotated = annotate_frame(
+                frame,
+                frame_detections,
+                frames_processed,
+                curr_fps,
+                boundary_line=boundary_line,
+            )
             writer.write(annotated)
 
         total_elapsed = max(time.perf_counter() - start_time, 1e-5)
@@ -276,6 +317,7 @@ def process_video(
             video_width=width,
             video_height=height,
             source_fps=source_fps,
+            event_candidates=event_candidates,
         )
 
     finally:
@@ -288,12 +330,25 @@ def process_video(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="TrackGuard AI - Basic Vehicle Detection")
+    parser = argparse.ArgumentParser(description="TrackGuard AI - Vehicle Detection and Boundary Candidates")
     parser.add_argument("--input", "-i", required=True, help="Path to input video file")
     parser.add_argument("--output", "-o", default="runs/detected_output.mp4", help="Path to output annotated video file")
     parser.add_argument("--conf", type=float, default=0.35, help="Confidence threshold (default: 0.35)")
     parser.add_argument("--device", default="auto", help="Inference device: 'cpu', 'cuda', or 'auto'")
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum number of frames to process")
+    parser.add_argument(
+        "--boundary",
+        type=float,
+        nargs=4,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        help="Optional boundary endpoints in normalized 0..1 frame coordinates",
+    )
+    parser.add_argument(
+        "--boundary-hysteresis-pixels",
+        type=float,
+        default=5.0,
+        help="Stable-side margin for boundary crossing candidates (default: 5 pixels)",
+    )
     parser.add_argument(
         "--no-track",
         dest="enable_tracking",
@@ -302,7 +357,20 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    cfg = TrackGuardConfig(confidence_threshold=args.conf, device=args.device)
+    boundary = None
+    if args.boundary is not None:
+        boundary = TrackBoundary(
+            start_x=args.boundary[0],
+            start_y=args.boundary[1],
+            end_x=args.boundary[2],
+            end_y=args.boundary[3],
+        )
+    cfg = TrackGuardConfig(
+        confidence_threshold=args.conf,
+        device=args.device,
+        track_boundary=boundary,
+        boundary_hysteresis_pixels=args.boundary_hysteresis_pixels,
+    )
     summary = process_video(
         input_path=args.input,
         output_path=args.output,

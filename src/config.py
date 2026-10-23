@@ -68,7 +68,17 @@ class TrackGuardConfig(BaseModel):
         default=10.0,
         gt=0.0,
         le=60.0,
-        description="Duration of sliding video buffer retained around detected candidate events."
+        description="Maximum total evidence clip duration around a detected candidate event."
+    )
+    evidence_pre_seconds: float = Field(
+        default=3.0,
+        ge=0.0,
+        description="Seconds of video to retain before a candidate event."
+    )
+    evidence_post_seconds: float = Field(
+        default=3.0,
+        ge=0.0,
+        description="Seconds of video to retain after a candidate event."
     )
     track_limits_margin_pixels: float = Field(
         default=0.0,
@@ -91,3 +101,9 @@ class TrackGuardConfig(BaseModel):
         if not (0.0 <= value <= 1.0):
             raise ValueError(f"Threshold must be between 0.0 and 1.0, got {value}")
         return value
+
+    @model_validator(mode="after")
+    def validate_evidence_window(self):
+        if self.evidence_pre_seconds + self.evidence_post_seconds > self.max_event_buffer_seconds:
+            raise ValueError("Evidence pre/post duration must not exceed max_event_buffer_seconds")
+        return self

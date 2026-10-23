@@ -10,6 +10,7 @@ except ImportError:
     torch = None
 
 from src.config import TrackBoundary, TrackGuardConfig
+from src.evidence import EvidenceCapture
 from src.events import BoundaryEventDetector
 from src.schemas import TrackEventRecord
 
@@ -198,6 +199,8 @@ def process_video(
         raise RuntimeError(f"Failed to open video source: {in_path}")
 
     writer: Optional[cv2.VideoWriter] = None
+    evidence_capture: Optional[EvidenceCapture] = None
+    evidence_capture_finished = False
 
     try:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -233,6 +236,15 @@ def process_video(
                 height,
                 cfg.boundary_hysteresis_pixels,
             )
+            if enable_tracking:
+                evidence_capture = EvidenceCapture(
+                    evidence_dir=cfg.evidence_dir,
+                    source_path=in_path,
+                    fps=source_fps,
+                    frame_size=(width, height),
+                    pre_seconds=cfg.evidence_pre_seconds,
+                    post_seconds=cfg.evidence_post_seconds,
+                )
         start_time = time.perf_counter()
 
         while True:
@@ -265,6 +277,7 @@ def process_video(
 
             # Parse vehicle detections
             frame_detections = []
+            frame_events: list[TrackEventRecord] = []
             if results and len(results) > 0 and results[0].boxes is not None:
                 boxes = results[0].boxes
                 for box in boxes:
@@ -288,6 +301,7 @@ def process_video(
                             )
                             if event is not None:
                                 event_candidates.append(event)
+                                frame_events.append(event)
 
             total_vehicle_detections += len(frame_detections)
             frames_processed += 1
@@ -303,7 +317,12 @@ def process_video(
                 boundary_line=boundary_line,
             )
             writer.write(annotated)
+            if evidence_capture is not None:
+                evidence_capture.push_frame(frames_processed, annotated, frame_events)
 
+        if evidence_capture is not None:
+            evidence_capture.finish()
+            evidence_capture_finished = True
         total_elapsed = max(time.perf_counter() - start_time, 1e-5)
         overall_fps = frames_processed / total_elapsed
 
@@ -325,6 +344,8 @@ def process_video(
             cap.release()
         if writer is not None:
             writer.release()
+        if evidence_capture is not None and not evidence_capture_finished:
+            evidence_capture.abort()
 
 
 if __name__ == "__main__":
@@ -349,6 +370,19 @@ if __name__ == "__main__":
         default=5.0,
         help="Stable-side margin for boundary crossing candidates (default: 5 pixels)",
     )
+    parser.add_argument("--evidence-dir", default="evidence", help="Directory for local event frames and clips")
+    parser.add_argument(
+        "--evidence-before-seconds",
+        type=float,
+        default=3.0,
+        help="Seconds of event clip before the crossing candidate (default: 3)",
+    )
+    parser.add_argument(
+        "--evidence-after-seconds",
+        type=float,
+        default=3.0,
+        help="Seconds of event clip after the crossing candidate (default: 3)",
+    )
     parser.add_argument(
         "--no-track",
         dest="enable_tracking",
@@ -370,6 +404,9 @@ if __name__ == "__main__":
         device=args.device,
         track_boundary=boundary,
         boundary_hysteresis_pixels=args.boundary_hysteresis_pixels,
+        evidence_dir=args.evidence_dir,
+        evidence_pre_seconds=args.evidence_before_seconds,
+        evidence_post_seconds=args.evidence_after_seconds,
     )
     summary = process_video(
         input_path=args.input,

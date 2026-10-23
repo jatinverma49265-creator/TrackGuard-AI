@@ -53,6 +53,23 @@ class TestTrackEventSchemas(unittest.TestCase):
         self.assertEqual(record.video_time_seconds, 0.44)
         self.assertEqual(record.review_status, ReviewStatus.PENDING_REVIEW)
 
+    def test_evidence_references_and_audio_status_are_optional(self):
+        record = TrackEventRecord(
+            event_id="evt-evidence",
+            event_type=EventType.TRACK_LIMIT_CANDIDATE,
+            timestamp=None,
+        )
+        self.assertIsNone(record.evidence_reference)
+        self.assertIsNone(record.evidence_frame_reference)
+        self.assertIsNone(record.evidence_clip_reference)
+        self.assertIsNone(record.evidence_audio_status)
+
+        record.evidence_frame_reference = "evidence/frame.jpg"
+        record.evidence_clip_reference = "evidence/clip.mp4"
+        record.evidence_reference = record.evidence_clip_reference
+        record.evidence_audio_status = "unavailable"
+        self.assertEqual(record.model_dump(mode="json")["evidence_audio_status"], "unavailable")
+
     def test_invalid_confidence_raises_error(self):
         with self.assertRaises(ValidationError):
             TrackEventRecord(

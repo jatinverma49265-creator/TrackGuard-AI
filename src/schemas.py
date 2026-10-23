@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -91,6 +91,18 @@ class TrackEventRecord(BaseModel):
     evidence_reference: Optional[str] = Field(
         default=None,
         description="Reference path or identifier for associated video clip or keyframe image."
+    )
+    evidence_frame_reference: Optional[str] = Field(
+        default=None,
+        description="Local path to the annotated event frame, when evidence capture succeeds."
+    )
+    evidence_clip_reference: Optional[str] = Field(
+        default=None,
+        description="Local path to the event video clip, when evidence capture succeeds."
+    )
+    evidence_audio_status: Optional[Literal["preserved", "source_has_no_audio", "unavailable"]] = Field(
+        default=None,
+        description="Whether clip audio was preserved, absent at source, or unavailable to capture."
     )
     review_status: ReviewStatus = Field(
         default=ReviewStatus.PENDING_REVIEW,

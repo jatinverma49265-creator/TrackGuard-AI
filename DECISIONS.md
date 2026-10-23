@@ -33,4 +33,9 @@
 ## Decision 7: Track-Boundary Candidate Detection
 - **Context**: Fixed-camera video can be configured with one manually selected finite boundary segment. Boundary observations must remain reviewable candidates and should not depend on costly image processing.
 - **Decision**: Store the segment endpoints as normalized frame coordinates. Use each ByteTrack ID's bounding-box bottom-center point and finite-segment intersection, with a dedicated 5-pixel stable-side hysteresis margin. Emit a candidate on each stable crossing in either direction and re-arm for later recrossings.
-- **Consequence**: Per-track state remains local to one video-processing run. Candidates use `TRACK_LIMIT_CANDIDATE`, remain `pending_review`, and record frame index plus video-relative seconds. No wall-clock time is invented when source recording time is unavailable; candidate persistence and evidence clips remain out of scope.
+- **Consequence**: Per-track state remains local to one video-processing run. Candidates use `TRACK_LIMIT_CANDIDATE`, remain `pending_review`, and record frame index plus video-relative seconds. No wall-clock time is invented when source recording time is unavailable; candidate persistence remains out of scope.
+
+## Decision 8: Local Candidate Evidence Capture
+- **Context**: Boundary candidates need a reviewable event frame and short surrounding clip without retaining a full video in memory or depending on remote storage.
+- **Decision**: Keep a bounded JPEG-compressed pre-event ring, save annotated event frames and per-event clips locally, and capture up to three seconds before and after each event. Use FFmpeg to mux source audio when available; if FFmpeg is unavailable, keep the video-only clip and mark audio status `unavailable`.
+- **Consequence**: Evidence paths are stored on the candidate record and event folders are unique. Each frame and clip is checked for readability before its paths are linked. Capture errors abort processing and remove incomplete evidence so it cannot be mistaken for a complete package. All candidates remain `pending_review`.

@@ -16,6 +16,8 @@ class TestTrackGuardConfig(unittest.TestCase):
         self.assertEqual(cfg.iou_threshold, 0.45)
         self.assertEqual(cfg.evidence_dir, "evidence")
         self.assertEqual(cfg.max_event_buffer_seconds, 10.0)
+        self.assertEqual(cfg.evidence_pre_seconds, 3.0)
+        self.assertEqual(cfg.evidence_post_seconds, 3.0)
         self.assertEqual(cfg.track_limits_margin_pixels, 0.0)
         self.assertIsNone(cfg.track_boundary)
         self.assertEqual(cfg.boundary_hysteresis_pixels, 5.0)
@@ -62,6 +64,12 @@ class TestTrackGuardConfig(unittest.TestCase):
     def test_boundary_hysteresis_margin_must_be_non_negative(self):
         with self.assertRaises(ValidationError):
             TrackGuardConfig(boundary_hysteresis_pixels=-1.0)
+
+    def test_evidence_window_must_fit_inside_maximum_buffer(self):
+        cfg = TrackGuardConfig(evidence_pre_seconds=4.0, evidence_post_seconds=4.0)
+        self.assertEqual(cfg.evidence_pre_seconds + cfg.evidence_post_seconds, 8.0)
+        with self.assertRaises(ValidationError):
+            TrackGuardConfig(evidence_pre_seconds=6.0, evidence_post_seconds=5.0)
 
 
 if __name__ == "__main__":

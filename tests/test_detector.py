@@ -164,6 +164,7 @@ class TestDetector(unittest.TestCase):
         mock_model.track.side_effect = frame_results
         cfg = TrackGuardConfig(
             device="cpu",
+            evidence_dir=str(self.temp_path / "evidence"),
             track_boundary=TrackBoundary(
                 start_x=0.5,
                 start_y=0.2,
@@ -173,7 +174,8 @@ class TestDetector(unittest.TestCase):
             boundary_hysteresis_pixels=5.0,
         )
 
-        summary = process_video(synthetic_video, out_path, config=cfg, model=mock_model)
+        with patch("src.evidence.shutil.which", return_value=None):
+            summary = process_video(synthetic_video, out_path, config=cfg, model=mock_model)
 
         self.assertEqual(summary.total_frames, 5)
         self.assertTrue(out_path.is_file())
@@ -185,9 +187,48 @@ class TestDetector(unittest.TestCase):
         self.assertIsNone(event.timestamp)
         self.assertEqual(event.review_status.value, "pending_review")
         self.assertIn("positive_to_negative", event.notes)
+        self.assertTrue(Path(event.evidence_frame_reference).is_file())
+        self.assertTrue(Path(event.evidence_clip_reference).is_file())
+        self.assertEqual(event.evidence_reference, event.evidence_clip_reference)
+        self.assertEqual(event.evidence_audio_status, "unavailable")
+        evidence_clip = cv2.VideoCapture(event.evidence_clip_reference)
+        decoded_evidence_frames = 0
+        while evidence_clip.read()[0]:
+            decoded_evidence_frames += 1
+        evidence_clip.release()
+        self.assertEqual(decoded_evidence_frames, 5)
         serialized_event = summary.to_dict()["event_candidates"][0]
         self.assertEqual(serialized_event["video_time_seconds"], 0.2)
         self.assertEqual(serialized_event["review_status"], "pending_review")
+        self.assertEqual(serialized_event["evidence_audio_status"], "unavailable")
+
+    def test_configured_boundary_without_events_creates_no_evidence_files(self):
+        synthetic_video = self._create_synthetic_video("no_boundary_crossing_in.mp4")
+        evidence_dir = self.temp_path / "unused_evidence"
+        mock_box = MagicMock()
+        mock_box.cls = [MagicMock(item=lambda: 2)]
+        mock_box.xyxy = [MagicMock(tolist=lambda: [30.0, 40.0, 100.0, 120.0])]
+        mock_box.conf = [MagicMock(item=lambda: 0.92)]
+        mock_box.id = [MagicMock(item=lambda: 17)]
+        mock_result = MagicMock()
+        mock_result.boxes = [mock_box]
+        mock_model = MagicMock()
+        mock_model.track.return_value = [mock_result]
+        cfg = TrackGuardConfig(
+            device="cpu",
+            evidence_dir=str(evidence_dir),
+            track_boundary=TrackBoundary(start_x=0.8, start_y=0.1, end_x=0.8, end_y=0.9),
+        )
+
+        summary = process_video(
+            synthetic_video,
+            self.temp_path / "no_boundary_crossing_out.mp4",
+            config=cfg,
+            model=mock_model,
+        )
+
+        self.assertEqual(summary.event_candidates, [])
+        self.assertFalse(evidence_dir.exists())
 
     def test_annotate_frame_includes_track_id_when_available(self):
         frame = np.zeros((240, 320, 3), dtype=np.uint8)

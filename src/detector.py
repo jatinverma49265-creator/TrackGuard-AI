@@ -1,6 +1,8 @@
 import time
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set
 import cv2
 import numpy as np
 
@@ -12,7 +14,7 @@ except ImportError:
 from src.config import TrackBoundary, TrackGuardConfig
 from src.evidence import EvidenceCapture
 from src.events import BoundaryEventDetector
-from src.schemas import TrackEventRecord
+from src.schemas import ProcessingProgress, TrackEventRecord
 
 # COCO vehicle class identifiers
 COCO_VEHICLE_CLASSES: Dict[int, str] = {
@@ -38,6 +40,7 @@ class VideoProcessingSummary:
         video_height: int,
         source_fps: float,
         event_candidates: Optional[list[TrackEventRecord]] = None,
+        audio_status: str = "unknown",
     ):
         self.input_path = input_path
         self.output_path = output_path
@@ -49,6 +52,7 @@ class VideoProcessingSummary:
         self.video_height = video_height
         self.source_fps = source_fps
         self.event_candidates = event_candidates or []
+        self.audio_status = audio_status
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -61,8 +65,13 @@ class VideoProcessingSummary:
             "video_width": self.video_width,
             "video_height": self.video_height,
             "source_fps": round(self.source_fps, 2),
+            "audio_status": self.audio_status,
             "event_candidates": [event.model_dump(mode="json") for event in self.event_candidates],
         }
+
+
+class ProcessingCancelledError(RuntimeError):
+    """Raised when a processing run is cancelled at a frame boundary."""
 
 
 def resolve_device(requested_device: str) -> str:
@@ -85,8 +94,13 @@ def annotate_frame(
     frame_idx: int,
     current_fps: float,
     boundary_line: Optional[tuple[tuple[int, int], tuple[int, int]]] = None,
+    unique_tracks: int = 0,
+    candidate_count: int = 0,
+    mean_confidence: float = 0.0,
+    tracking_enabled: bool = True,
+    boundary_configured: bool = False,
 ) -> np.ndarray:
-    """Draws bounding boxes, labels, and telemetry overlay on a single frame."""
+    """Draw detections and a compact trackside review summary."""
     annotated = frame.copy()
 
     if boundary_line is not None:
@@ -130,30 +144,92 @@ def annotate_frame(
             cv2.LINE_AA,
         )
 
-    # Telemetry HUD overlay
-    hud_text = f"Frame: {frame_idx} | Proc FPS: {current_fps:.1f} | Vehicles: {len(detections)}"
-    cv2.putText(
-        annotated,
-        hud_text,
-        (16, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
+    # Keep the live processing readout small and legible.
+    hud_text = f"FRAME {frame_idx:05d}   {current_fps:.1f} PROC FPS"
+    hud_width = min(310, max(190, annotated.shape[1] - 32))
+    hud_layer = annotated.copy()
+    cv2.rectangle(hud_layer, (16, 16), (16 + hud_width, 49), (18, 25, 35), -1)
+    cv2.addWeighted(hud_layer, 0.78, annotated, 0.22, 0, annotated)
+    cv2.putText(annotated, hud_text, (27, 39), cv2.FONT_HERSHEY_SIMPLEX,
+                0.52, (115, 220, 255), 1, cv2.LINE_AA)
+
+    # Compact, translucent analysis panel in the upper-right corner.
+    panel_width = min(360, max(180, annotated.shape[1] - 32))
+    panel_height = min(224, max(126, annotated.shape[0] - 32))
+    right = annotated.shape[1] - 16
+    left = max(16, right - panel_width)
+    top = 16
+    bottom = min(annotated.shape[0] - 16, top + panel_height)
+    panel = annotated.copy()
+    cv2.rectangle(panel, (left, top), (right, bottom), (18, 25, 35), -1)
+    cv2.addWeighted(panel, 0.82, annotated, 0.18, 0, annotated)
+    cv2.rectangle(annotated, (left, top), (right, bottom), (74, 92, 112), 1)
+    cv2.rectangle(annotated, (left, top), (left + 3, bottom), (0, 190, 255), -1)
+
+    scale = max(0.44, min(0.62, annotated.shape[1] / 1500.0))
+    line_height = max(21, int(30 * scale / 0.5))
+    x = left + 15
+    y = top + 25
+    title = "TRACKGUARD  /  LIVE REVIEW"
+    cv2.putText(annotated, title, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale * 0.88,
+                (225, 235, 245), 1, cv2.LINE_AA)
+    y += line_height + 2
+    cv2.line(annotated, (x, y - 7), (right - 14, y - 7), (74, 92, 112), 1, cv2.LINE_AA)
+
+    rows = [
+        ("VEHICLES NOW", str(len(detections)), (90, 220, 160)),
+        ("TRACKS SEEN", str(unique_tracks) if tracking_enabled else "tracking off", (120, 195, 255)),
+        ("MEAN CONFIDENCE", f"{mean_confidence:.0%}" if detections else "—", (210, 215, 225)),
+        ("BOUNDARY CANDIDATES", str(candidate_count), (80, 170, 255)),
+    ]
+    for label, value, value_color in rows:
+        cv2.putText(annotated, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale * 0.64, (155, 170, 185), 1, cv2.LINE_AA)
+        value_size = cv2.getTextSize(value, cv2.FONT_HERSHEY_SIMPLEX, scale * 0.78, 1)[0]
+        cv2.putText(annotated, value, (right - 14 - value_size[0], y),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale * 0.78, value_color, 1, cv2.LINE_AA)
+        y += line_height
+
+    footer = "REVIEW REQUIRED" if candidate_count else (
+        "NO CANDIDATES" if boundary_configured else "BOUNDARY NOT CONFIGURED"
     )
-    cv2.putText(
-        annotated,
-        hud_text,
-        (16, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 165, 255),
-        1,
-        cv2.LINE_AA,
-    )
+    cv2.putText(annotated, footer, (x, min(bottom - 9, y + 2)), cv2.FONT_HERSHEY_SIMPLEX,
+                scale * 0.56, (80, 190, 255) if candidate_count else (110, 190, 155),
+                1, cv2.LINE_AA)
 
     return annotated
+
+
+def _get_ffmpeg_path() -> Optional[str]:
+    """Find system FFmpeg or the executable bundled by imageio-ffmpeg."""
+    executable = shutil.which("ffmpeg")
+    if executable:
+        return executable
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError):
+        return None
+
+
+def _mux_source_audio(ffmpeg: str, video_path: Path, source_path: Path,
+                      output_path: Path, duration_seconds: float) -> str:
+    """Mux original audio into the annotated video and verify the audio stream."""
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_path),
+         "-i", str(source_path), "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy",
+         "-c:a", "aac", "-t", f"{duration_seconds:.6f}", "-movflags", "+faststart",
+         str(output_path)],
+        capture_output=True, text=True, timeout=180, check=False,
+    )
+    if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"FFmpeg could not mux source audio: {(result.stderr or '').strip()[-1200:]}")
+    probe = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(output_path),
+         "-map", "0:a:0", "-frames:a", "1", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    return "preserved" if probe.returncode == 0 else "source_has_no_audio"
 
 
 def process_video(
@@ -163,6 +239,8 @@ def process_video(
     model: Optional[Any] = None,
     max_frames: Optional[int] = None,
     enable_tracking: bool = True,
+    progress_callback: Optional[Callable[[ProcessingProgress], None]] = None,
+    cancellation_requested: Optional[Callable[[], bool]] = None,
 ) -> VideoProcessingSummary:
     """Detects and annotates vehicles, optionally tracking them with ByteTrack.
     
@@ -173,6 +251,8 @@ def process_video(
         model: Optional pre-instantiated YOLO model or compatible mock.
         max_frames: Optional limit on frames to process (useful for short tests/benchmarks).
         enable_tracking: Use ByteTrack to assign persistent IDs across video frames.
+        progress_callback: Optional callback invoked after each completed frame.
+        cancellation_requested: Optional predicate checked at frame boundaries.
 
     Returns:
         VideoProcessingSummary containing execution metrics.
@@ -182,6 +262,8 @@ def process_video(
 
     if not in_path.is_file():
         raise FileNotFoundError(f"Input video file not found: {in_path}")
+    if in_path.resolve() == out_path.resolve():
+        raise ValueError("Input and output video paths must be different")
 
     cfg = config or TrackGuardConfig()
     device = resolve_device(cfg.device)
@@ -195,14 +277,17 @@ def process_video(
         model = YOLO(str(default_weight))
 
     cap = cv2.VideoCapture(str(in_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video source: {in_path}")
-
     writer: Optional[cv2.VideoWriter] = None
+    video_only_path = out_path.with_name(f".{out_path.stem}.video-only{out_path.suffix}")
+    muxed_path = out_path.with_name(f".{out_path.stem}.with-audio{out_path.suffix}")
     evidence_capture: Optional[EvidenceCapture] = None
     evidence_capture_finished = False
+    audio_status = "unavailable"
 
     try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video source: {in_path}")
+
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         source_fps = float(cap.get(cv2.CAP_PROP_FPS))
@@ -214,12 +299,18 @@ def process_video(
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, source_fps, (width, height))
+        writer = cv2.VideoWriter(str(video_only_path), fourcc, source_fps, (width, height))
         if not writer.isOpened():
-            raise RuntimeError(f"Failed to initialize video output writer at {out_path}")
+            raise RuntimeError(f"Failed to initialize video output writer at {video_only_path}")
 
         frames_processed = 0
+        reported_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if reported_total_frames <= 0:
+            reported_total_frames = None
+        elif max_frames is not None:
+            reported_total_frames = min(reported_total_frames, max_frames)
         total_vehicle_detections = 0
+        unique_track_ids: set[int] = set()
         event_candidates: list[TrackEventRecord] = []
         boundary_detector = None
         boundary_line = None
@@ -248,6 +339,8 @@ def process_video(
         start_time = time.perf_counter()
 
         while True:
+            if cancellation_requested is not None and cancellation_requested():
+                raise ProcessingCancelledError("Video processing was cancelled.")
             if max_frames is not None and frames_processed >= max_frames:
                 break
 
@@ -291,6 +384,8 @@ def process_video(
                         frame_detections.append(
                             (xyxy[0], xyxy[1], xyxy[2], xyxy[3], conf, cls_id, track_id)
                         )
+                        if track_id is not None:
+                            unique_track_ids.add(track_id)
                         if boundary_detector is not None:
                             event = boundary_detector.update(
                                 track_id=track_id,
@@ -315,16 +410,44 @@ def process_video(
                 frames_processed,
                 curr_fps,
                 boundary_line=boundary_line,
+                unique_tracks=len(unique_track_ids),
+                candidate_count=len(event_candidates),
+                mean_confidence=(sum(det[4] for det in frame_detections) / len(frame_detections))
+                if frame_detections else 0.0,
+                tracking_enabled=enable_tracking,
+                boundary_configured=cfg.track_boundary is not None,
             )
             writer.write(annotated)
             if evidence_capture is not None:
                 evidence_capture.push_frame(frames_processed, annotated, frame_events)
+            if progress_callback is not None:
+                progress_callback(ProcessingProgress(
+                    processed_frames=frames_processed,
+                    total_frames=reported_total_frames,
+                ))
+            if cancellation_requested is not None and cancellation_requested():
+                raise ProcessingCancelledError("Video processing was cancelled.")
 
         if evidence_capture is not None:
             evidence_capture.finish()
             evidence_capture_finished = True
+        # OpenCV does not write audio. Close its video stream, then mux the
+        # original soundtrack and limit it to the frames actually processed.
+        writer.release()
+        writer = None
         total_elapsed = max(time.perf_counter() - start_time, 1e-5)
         overall_fps = frames_processed / total_elapsed
+        ffmpeg = _get_ffmpeg_path()
+        if ffmpeg is None:
+            raise RuntimeError(
+                "Audio muxing requires FFmpeg. Install project dependencies with "
+                "'.venv\\Scripts\\python.exe -m pip install -r requirements.txt'."
+            )
+        audio_status = _mux_source_audio(
+            ffmpeg, video_only_path, in_path, muxed_path, frames_processed / source_fps
+        )
+        muxed_path.replace(out_path)
+        video_only_path.unlink(missing_ok=True)
 
         return VideoProcessingSummary(
             input_path=str(in_path),
@@ -337,6 +460,7 @@ def process_video(
             video_height=height,
             source_fps=source_fps,
             event_candidates=event_candidates,
+            audio_status=audio_status,
         )
 
     finally:
@@ -344,6 +468,8 @@ def process_video(
             cap.release()
         if writer is not None:
             writer.release()
+        video_only_path.unlink(missing_ok=True)
+        muxed_path.unlink(missing_ok=True)
         if evidence_capture is not None and not evidence_capture_finished:
             evidence_capture.abort()
 

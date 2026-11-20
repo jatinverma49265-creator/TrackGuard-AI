@@ -82,7 +82,7 @@ class EvidenceCapture:
         self.ffmpeg_path = shutil.which("ffmpeg")
         self.ffprobe_path = shutil.which("ffprobe")
         self._active: list[_ActiveClip] = []
-        self._completed: list[_ActiveClip] = []
+        self._finalized_events: list[TrackEventRecord] = []
         self._folders: set[Path] = set()
         self._finished = False
 
@@ -170,6 +170,7 @@ class EvidenceCapture:
                 self._active.append(self._start_clip(event, frame_index, annotated_frame))
 
             still_active: list[_ActiveClip] = []
+            completed_now: list[_ActiveClip] = []
             for clip in self._active:
                 if clip.trigger_frame_index != frame_index:
                     clip.writer.write(annotated_frame)
@@ -177,10 +178,13 @@ class EvidenceCapture:
                     clip.remaining_post_frames -= 1
                 if clip.remaining_post_frames <= 0:
                     clip.writer.release()
-                    self._completed.append(clip)
+                    completed_now.append(clip)
                 else:
                     still_active.append(clip)
             self._active = still_active
+            for clip in completed_now:
+                self._finalized_events.append(clip.event)
+                self._finalize_clip(clip)
             self.buffer.append(frame_index, annotated_frame)
         except Exception as exc:
             self.abort()
@@ -335,10 +339,11 @@ class EvidenceCapture:
         try:
             for clip in self._active:
                 clip.writer.release()
-                self._completed.append(clip)
-            self._active.clear()
-            for clip in self._completed:
+                self._finalized_events.append(clip.event)
                 self._finalize_clip(clip)
+            self._active.clear()
+            self._finalized_events.clear()
+            self._folders.clear()
             self._finished = True
         except Exception:
             self.abort()
@@ -346,14 +351,21 @@ class EvidenceCapture:
 
     def abort(self) -> None:
         """Close active writers and remove this run's incomplete evidence folders."""
-        for clip in self._active + self._completed:
+        if self._finished:
+            return
+        for clip in self._active:
             try:
                 clip.writer.release()
             except Exception:
                 pass
         for folder in self._folders:
             shutil.rmtree(folder, ignore_errors=True)
+        for event in self._finalized_events:
+            event.evidence_reference = None
+            event.evidence_frame_reference = None
+            event.evidence_clip_reference = None
+            event.evidence_audio_status = None
         self._active.clear()
-        self._completed.clear()
+        self._finalized_events.clear()
         self._folders.clear()
         self._finished = True

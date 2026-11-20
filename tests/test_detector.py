@@ -8,6 +8,7 @@ import numpy as np
 from src.config import TrackBoundary, TrackGuardConfig
 from src.detector import (
     COCO_VEHICLE_CLASSES,
+    ProcessingCancelledError,
     VEHICLE_CLASS_IDS,
     annotate_frame,
     process_video,
@@ -51,6 +52,18 @@ class TestDetector(unittest.TestCase):
         out_path = self.temp_path / "out.mp4"
         with self.assertRaises(RuntimeError):
             process_video(corrupt_file, out_path)
+
+    def test_failed_video_capture_is_released(self):
+        input_path = self.temp_path / "capture_failure.mp4"
+        input_path.write_bytes(b"video")
+        capture = MagicMock()
+        capture.isOpened.return_value = False
+
+        with patch("src.detector.cv2.VideoCapture", return_value=capture):
+            with self.assertRaisesRegex(RuntimeError, "Failed to open video source"):
+                process_video(input_path, self.temp_path / "capture_failure_out.mp4", model=MagicMock())
+
+        capture.release.assert_called_once_with()
 
     def test_annotate_frame_output_shape_and_type(self):
         frame = np.zeros((240, 320, 3), dtype=np.uint8)
@@ -229,6 +242,111 @@ class TestDetector(unittest.TestCase):
 
         self.assertEqual(summary.event_candidates, [])
         self.assertFalse(evidence_dir.exists())
+
+    def test_progress_callback_reports_only_completed_frames(self):
+        synthetic_video = self._create_synthetic_video("progress_in.mp4", num_frames=4)
+        mock_model = MagicMock()
+        mock_model.return_value = [MagicMock(boxes=[])]
+        progress = []
+
+        summary = process_video(
+            synthetic_video,
+            self.temp_path / "progress_out.mp4",
+            model=mock_model,
+            progress_callback=progress.append,
+        )
+
+        self.assertEqual(summary.total_frames, 4)
+        self.assertEqual([item.processed_frames for item in progress], [1, 2, 3, 4])
+        self.assertTrue(all(item.total_frames == 4 for item in progress))
+
+    def test_cancellation_releases_resources_and_cleans_partial_outputs(self):
+        synthetic_video = self._create_synthetic_video("cancel_in.mp4", num_frames=5)
+        output_path = self.temp_path / "cancel_out.mp4"
+        evidence_dir = self.temp_path / "cancel_evidence"
+        centers = [120.0, 140.0, 180.0, 200.0, 220.0]
+        results = []
+        for center_x in centers:
+            box = MagicMock()
+            box.cls = [MagicMock(item=lambda: 2)]
+            box.xyxy = [MagicMock(tolist=lambda cx=center_x: [cx - 10.0, 100.0, cx + 10.0, 120.0])]
+            box.conf = [MagicMock(item=lambda: 0.91)]
+            box.id = [MagicMock(item=lambda: 23)]
+            results.append([MagicMock(boxes=[box])])
+        mock_model = MagicMock()
+        mock_model.track.side_effect = results
+        config = TrackGuardConfig(
+            device="cpu",
+            evidence_dir=str(evidence_dir),
+            track_boundary=TrackBoundary(
+                start_x=0.5, start_y=0.2, end_x=0.5, end_y=0.8
+            ),
+        )
+        cancel = {"requested": False}
+        progress = []
+        evidence_existed_before_cancellation = []
+
+        def report_progress(item):
+            progress.append(item)
+            if item.processed_frames == 3:
+                evidence_files = [path for path in evidence_dir.rglob("*") if path.is_file()]
+                self.assertTrue(
+                    evidence_files,
+                    "Expected a captured event evidence artifact before cancellation.",
+                )
+                evidence_existed_before_cancellation.append(True)
+                cancel["requested"] = True
+
+        original_capture = cv2.VideoCapture
+        original_writer = cv2.VideoWriter
+        created_captures = []
+        created_writers = []
+
+        class TrackedResource:
+            def __init__(self, resource):
+                self.resource = resource
+                self.released = False
+
+            def __getattr__(self, name):
+                return getattr(self.resource, name)
+
+            def release(self):
+                self.released = True
+                return self.resource.release()
+
+        def make_capture(*args, **kwargs):
+            resource = TrackedResource(original_capture(*args, **kwargs))
+            created_captures.append(resource)
+            return resource
+
+        def make_writer(*args, **kwargs):
+            resource = TrackedResource(original_writer(*args, **kwargs))
+            created_writers.append(resource)
+            return resource
+
+        with patch("src.detector.cv2.VideoCapture", side_effect=make_capture), patch(
+            "src.detector.cv2.VideoWriter", side_effect=make_writer
+        ), patch("src.evidence.shutil.which", return_value=None):
+            with self.assertRaises(ProcessingCancelledError):
+                process_video(
+                    synthetic_video,
+                    output_path,
+                    config=config,
+                    model=mock_model,
+                    progress_callback=report_progress,
+                    cancellation_requested=lambda: cancel["requested"],
+                )
+
+        self.assertEqual([item.processed_frames for item in progress], [1, 2, 3])
+        self.assertEqual(evidence_existed_before_cancellation, [True])
+        self.assertTrue(created_captures)
+        self.assertTrue(all(resource.released for resource in created_captures))
+        self.assertGreaterEqual(len(created_writers), 2)  # output and evidence clip
+        self.assertTrue(all(resource.released for resource in created_writers))
+        self.assertFalse(output_path.exists())
+        self.assertFalse(list(self.temp_path.glob(".cancel_out.*")))
+        self.assertTrue(evidence_dir.is_dir())
+        self.assertEqual(list(evidence_dir.rglob("*")), [])
 
     def test_annotate_frame_includes_track_id_when_available(self):
         frame = np.zeros((240, 320, 3), dtype=np.uint8)

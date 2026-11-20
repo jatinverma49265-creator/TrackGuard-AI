@@ -1,7 +1,9 @@
 from datetime import datetime
 from enum import Enum
 from typing import Literal, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
+
+from src.config import TrackGuardConfig
 
 
 class ReviewStatus(str, Enum):
@@ -112,3 +114,69 @@ class TrackEventRecord(BaseModel):
         default=None,
         description="Optional observational notes or review audit remarks."
     )
+
+
+class EventReviewEntry(BaseModel):
+    """Session review data stored separately from detector event records."""
+    status: ReviewStatus
+    notes: Optional[str] = Field(default=None, max_length=1000)
+
+
+class EventReviewData(BaseModel):
+    """Run-scoped human review decisions and optional reviewer notes."""
+    run_id: str = Field(min_length=1)
+    revision: int = Field(default=0, ge=0)
+    reviews: dict[str, EventReviewEntry] = Field(default_factory=dict)
+
+
+class ProcessingJobInput(BaseModel):
+    """Serializable, worker-neutral request for one video processing run.
+
+    Video identifiers are deliberately references rather than filesystem paths;
+    an execution adapter resolves them to the worker's local scratch space.
+    """
+    job_id: str = Field(min_length=1)
+    video_id: str = Field(min_length=1)
+    config: TrackGuardConfig = Field(default_factory=TrackGuardConfig)
+    max_frames: Optional[int] = Field(default=None, gt=0)
+    enable_tracking: bool = True
+
+    @field_serializer("config")
+    def serialize_config(self, config: TrackGuardConfig) -> dict:
+        # evidence_dir is an execution-local scratch path, not part of a job
+        # message. Deserialization uses the config's default until the adapter
+        # binds it to the job's isolated workspace.
+        return config.model_dump(mode="json", exclude={"evidence_dir"})
+
+
+class ProcessingProgress(BaseModel):
+    """Progress with actual completed frames and a metadata-derived estimate."""
+    processed_frames: int = Field(
+        ge=0,
+        description="Actual number of frames fully processed and written so far.",
+    )
+    total_frames: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Estimated total frame count from video metadata; it may differ from "
+            "the number of frames that can actually be decoded."
+        ),
+    )
+
+
+class ProcessingJobResult(BaseModel):
+    """Serializable processing output without worker-local filesystem paths."""
+    job_id: str = Field(min_length=1)
+    output_reference: str = Field(min_length=1)
+    total_frames: int = Field(ge=0)
+    vehicle_detections_count: int = Field(ge=0)
+    elapsed_seconds: float = Field(ge=0.0)
+    processing_fps: float = Field(ge=0.0)
+    video_width: int = Field(gt=0)
+    video_height: int = Field(gt=0)
+    source_fps: float = Field(gt=0.0)
+    audio_status: Literal[
+        "unknown", "preserved", "source_has_no_audio", "unavailable"
+    ]
+    event_candidates: list[TrackEventRecord] = Field(default_factory=list)

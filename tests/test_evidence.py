@@ -123,6 +123,72 @@ class TestEvidenceCapture(unittest.TestCase):
         self.assertAlmostEqual(decoded[0], 60, delta=10)
         self.assertAlmostEqual(decoded[-1], 140, delta=10)
 
+    def test_completed_multi_event_clips_keep_files_and_event_references(self):
+        capture = EvidenceCapture(
+            self.root / "evidence", self.source, 10.0, self.frame_size,
+            pre_seconds=0.0, post_seconds=0.0,
+        )
+        events = [_event("evt-first"), _event("evt-second")]
+        with patch("src.evidence.shutil.which", return_value=None):
+            capture.push_frame(1, self._frame(1), events)
+            self.assertEqual(capture._active, [])
+            capture.push_frame(2, self._frame(2), [])
+            capture.finish()
+
+        for event in events:
+            self.assertTrue(Path(event.evidence_frame_reference).is_file())
+            self.assertTrue(Path(event.evidence_clip_reference).is_file())
+            self.assertEqual(event.evidence_reference, event.evidence_clip_reference)
+            self.assertEqual(event.evidence_audio_status, "unavailable")
+            cap = cv2.VideoCapture(event.evidence_clip_reference)
+            ok, frame = cap.read()
+            self.assertTrue(ok)
+            self.assertEqual(frame.shape[:2], (48, 64))
+            self.assertFalse(cap.read()[0])
+            cap.release()
+
+    def test_later_failure_removes_already_finalized_event_folders(self):
+        capture = EvidenceCapture(
+            self.root / "evidence", self.source, 10.0, self.frame_size,
+            pre_seconds=0.0, post_seconds=0.0,
+        )
+        event = _event("evt-already-finalized")
+        with patch("src.evidence.shutil.which", return_value=None):
+            capture.push_frame(1, self._frame(1), [event])
+            finalized_folder = Path(event.evidence_clip_reference).parent
+            self.assertTrue(finalized_folder.is_dir())
+
+            with patch.object(capture.buffer, "append", side_effect=RuntimeError("buffer failure")):
+                with self.assertRaisesRegex(RuntimeError, "buffer failure"):
+                    capture.push_frame(2, self._frame(2), [])
+
+        self.assertFalse(finalized_folder.exists())
+        self.assertEqual(capture._folders, set())
+        self.assertIsNone(event.evidence_reference)
+        self.assertIsNone(event.evidence_frame_reference)
+        self.assertIsNone(event.evidence_clip_reference)
+        self.assertIsNone(event.evidence_audio_status)
+
+    def test_abort_after_successful_finish_preserves_evidence_and_references(self):
+        capture = EvidenceCapture(
+            self.root / "evidence", self.source, 10.0, self.frame_size,
+            pre_seconds=0.0, post_seconds=0.0,
+        )
+        event = _event("evt-finished")
+        with patch("src.evidence.shutil.which", return_value=None):
+            capture.push_frame(1, self._frame(1), [event])
+            capture.finish()
+            capture.abort()
+
+        frame_path = Path(event.evidence_frame_reference)
+        clip_path = Path(event.evidence_clip_reference)
+        event_folder = clip_path.parent
+        self.assertTrue(frame_path.is_file())
+        self.assertTrue(clip_path.is_file())
+        self.assertTrue(event_folder.is_dir())
+        self.assertEqual(event.evidence_reference, str(clip_path))
+        self.assertEqual(event.evidence_audio_status, "unavailable")
+
     def test_muxed_video_only_output_is_not_reported_as_audio_preserved(self):
         capture = EvidenceCapture(
             self.root / "evidence", self.source, 10.0, self.frame_size,
